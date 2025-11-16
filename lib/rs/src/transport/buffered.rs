@@ -97,6 +97,107 @@ where
         // TODO: was a bug here += <-- test somehow
         self.pos = cmp::min(self.cap, self.pos + consumed);
     }
+
+    /// Optimized read_exact that avoids std::io::default_read_exact's nested loops
+    /// Expected to reduce ~6% CPU overhead from default_read_exact
+    #[inline]
+    pub fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let buf_len = buf.len();
+
+        if buf_len == 0 {
+            return Ok(());
+        }
+
+        let buffered = self.cap - self.pos;
+
+        // Fast path: data already buffered (most common case)
+        if buffered >= buf_len {
+            // SAFETY: We verified buffered >= buf_len, so self.pos + buf_len <= self.cap
+            unsafe {
+                let src = self.buf.get_unchecked(self.pos..self.pos + buf_len);
+                buf.get_unchecked_mut(..buf_len).copy_from_slice(src);
+            }
+            self.pos += buf_len;
+            return Ok(());
+        }
+
+        let mut buf_pos = 0;
+
+        // Copy any buffered data first
+        if buffered > 0 {
+            buf[..buffered].copy_from_slice(&self.buf[self.pos..self.cap]);
+            buf_pos = buffered;
+            self.pos = self.cap;
+        }
+
+        let remaining = buf_len - buf_pos;
+
+        // Medium path: remaining data fits in one buffer refill
+        if remaining <= self.buf.len() {
+            self.pos = 0;
+            self.cap = self.chan.read(&mut self.buf)?;
+
+            if self.cap < remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill buffer",
+                ));
+            }
+
+            buf[buf_pos..].copy_from_slice(&self.buf[..remaining]);
+            self.pos = remaining;
+            return Ok(());
+        }
+
+        // Slow path: large read, bypass buffer entirely
+        self.chan.read_exact(&mut buf[buf_pos..])?;
+        self.pos = 0;
+        self.cap = 0;
+        Ok(())
+    }
+
+    /// Fast path for reading a single byte
+    #[inline]
+    pub fn read_u8(&mut self) -> io::Result<u8> {
+        if self.pos < self.cap {
+            // SAFETY: We verified self.pos < self.cap
+            let val = unsafe { *self.buf.get_unchecked(self.pos) };
+            self.pos += 1;
+            Ok(val)
+        } else {
+            // Refill buffer
+            self.pos = 0;
+            self.cap = self.chan.read(&mut self.buf)?;
+            if self.cap == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
+            }
+            let val = self.buf[0];
+            self.pos = 1;
+            Ok(val)
+        }
+    }
+
+    /// Fast path for reading fixed-size arrays (common for primitives)
+    #[inline]
+    pub fn read_array<const N: usize>(&mut self) -> io::Result<[u8; N]> {
+        let mut result = [0u8; N];
+
+        // Fast path: already buffered
+        let buffered = self.cap - self.pos;
+        if buffered >= N {
+            // SAFETY: We verified buffered >= N
+            unsafe {
+                let src = self.buf.get_unchecked(self.pos..self.pos + N);
+                result.get_unchecked_mut(..N).copy_from_slice(src);
+            }
+            self.pos += N;
+            return Ok(result);
+        }
+
+        // Fall back to read_exact for complex cases
+        self.read_exact(&mut result)?;
+        Ok(result)
+    }
 }
 
 impl<C> Read for TBufferedReadTransport<C>
@@ -124,6 +225,12 @@ where
         }
 
         Ok(bytes_read)
+    }
+
+    // Override the default read_exact to use our optimized implementation
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        TBufferedReadTransport::read_exact(self, buf)
     }
 }
 
