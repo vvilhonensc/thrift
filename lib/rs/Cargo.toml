@@ -1,7 +1,7 @@
 [package]
 name = "thrift"
 description = "Rust bindings for the Apache Thrift RPC system"
-edition = "2021"
+edition = "2024"
 version = "0.24.0"
 license = "Apache-2.0"
 authors = ["Apache Thrift Developers <dev@thrift.apache.org>"]
@@ -13,16 +13,21 @@ exclude = ["Makefile*", "test/**", "*.iml"]
 keywords = ["thrift"]
 
 [dependencies]
-byteorder = "1.3"
-integer-encoding = "3.0.3"
+byteorder = "1.5"
+integer-encoding = "4"
 uuid = "1"
-log = {version = "0.4", optional = true}
-ordered-float = "3.0"
-threadpool = {version = "1.7", optional = true}
+log = { version = "0.4", optional = true }
+ordered-float = "5"
+threadpool = { version = "1.7", optional = true }
 
 [features]
 default = ["server"]
 server = ["threadpool", "log"]
 
 [dev-dependencies]
+criterion = "0.7.0"
 uuid = { version = "*", features = ["v4"] }
+
+[[bench]]
+name = "binary_protocol"
+harness = false

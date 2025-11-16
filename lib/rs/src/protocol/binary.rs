@@ -17,6 +17,7 @@
 
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
 use std::convert::{From, TryFrom};
+use std::mem::MaybeUninit;
 
 use super::{
     TFieldIdentifier, TInputProtocol, TInputProtocolFactory, TListIdentifier, TMapIdentifier,
@@ -102,8 +103,8 @@ where
     #[allow(clippy::collapsible_if)]
     fn read_message_begin(&mut self) -> crate::Result<TMessageIdentifier> {
         // TODO: Once specialization is stable, call the message size tracking here
-        let mut first_bytes = vec![0; 4];
-        self.transport.read_exact(&mut first_bytes[..])?;
+        let mut first_bytes = [0u8; 4];
+        self.transport.read_exact(&mut first_bytes)?;
 
         // the thrift version header is intentionally negative
         // so the first check we'll do is see if the sign bit is set
@@ -136,8 +137,33 @@ where
                 // in the non-strict version the first message field
                 // is the message name. strings (byte arrays) are length-prefixed,
                 // so we've just read the length in the first 4 bytes
-                let name_size = BigEndian::read_i32(&first_bytes) as usize;
-                let mut name_buf: Vec<u8> = vec![0; name_size];
+                let name_size = BigEndian::read_i32(&first_bytes);
+                if name_size < 0 {
+                    return Err(crate::Error::Protocol(ProtocolError::new(
+                        ProtocolErrorKind::NegativeSize,
+                        format!("Negative message name size: {}", name_size),
+                    )));
+                }
+                if let Some(max_size) = self.config.max_string_size() {
+                    if name_size as usize > max_size {
+                        return Err(crate::Error::Protocol(ProtocolError::new(
+                            ProtocolErrorKind::SizeLimit,
+                            format!(
+                                "Message name size {} exceeds maximum allowed size of {}",
+                                name_size, max_size
+                            ),
+                        )));
+                    }
+                }
+                let name_size = name_size as usize;
+                let mut name_buf = Vec::with_capacity(name_size);
+                // SAFETY: We're about to initialize this memory via read_exact, which either:
+                // 1. Fills the entire buffer, making all bytes initialized, OR
+                // 2. Returns an error, in which case we return early and the vec is dropped
+                // Either way, no uninitialized memory escapes this function.
+                unsafe {
+                    name_buf.set_len(name_size);
+                }
                 self.transport.read_exact(&mut name_buf)?;
                 let name = String::from_utf8(name_buf)?;
 
@@ -180,6 +206,7 @@ where
         Ok(())
     }
 
+    #[inline(always)]
     fn read_bytes(&mut self) -> crate::Result<Vec<u8>> {
         let num_bytes = self.transport.read_i32::<BigEndian>()?;
 
@@ -202,13 +229,29 @@ where
             }
         }
 
-        let mut buf = vec![0u8; num_bytes as usize];
-        self.transport
-            .read_exact(&mut buf)
-            .map(|_| buf)
-            .map_err(From::from)
+        let num_bytes = num_bytes as usize;
+        if num_bytes == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(num_bytes);
+        // SAFETY: read_exact below either fully initializes the buffer or returns
+        // Err, in which case buf is dropped without being observed.
+        unsafe {
+            buf.set_len(num_bytes);
+        }
+
+        let buf_slice =
+            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, num_bytes) };
+
+        self.transport.read_exact(buf_slice)?;
+
+        let buf = unsafe { std::mem::transmute::<Vec<MaybeUninit<u8>>, Vec<u8>>(buf) };
+
+        Ok(buf)
     }
 
+    #[inline]
     fn read_bool(&mut self) -> crate::Result<bool> {
         let b = self.read_i8()?;
         match b {
@@ -217,26 +260,32 @@ where
         }
     }
 
+    #[inline]
     fn read_i8(&mut self) -> crate::Result<i8> {
         self.transport.read_i8().map_err(From::from)
     }
 
+    #[inline]
     fn read_i16(&mut self) -> crate::Result<i16> {
         self.transport.read_i16::<BigEndian>().map_err(From::from)
     }
 
+    #[inline]
     fn read_i32(&mut self) -> crate::Result<i32> {
         self.transport.read_i32::<BigEndian>().map_err(From::from)
     }
 
+    #[inline]
     fn read_i64(&mut self) -> crate::Result<i64> {
         self.transport.read_i64::<BigEndian>().map_err(From::from)
     }
 
+    #[inline]
     fn read_double(&mut self) -> crate::Result<f64> {
         self.transport.read_f64::<BigEndian>().map_err(From::from)
     }
 
+    #[inline]
     fn read_uuid(&mut self) -> crate::Result<uuid::Uuid> {
         let mut buf = [0u8; 16];
         self.transport
@@ -245,6 +294,7 @@ where
             .map_err(From::from)
     }
 
+    #[inline(always)]
     fn read_string(&mut self) -> crate::Result<String> {
         let bytes = self.read_bytes()?;
         String::from_utf8(bytes).map_err(From::from)
@@ -294,6 +344,7 @@ where
     // utility
     //
 
+    #[inline]
     fn read_byte(&mut self) -> crate::Result<u8> {
         self.transport.read_u8().map_err(From::from)
     }
@@ -437,11 +488,13 @@ where
         self.write_byte(field_type_to_u8(TType::Stop))
     }
 
+    #[inline]
     fn write_bytes(&mut self, b: &[u8]) -> crate::Result<()> {
         self.write_i32(b.len() as i32)?;
         self.transport.write_all(b).map_err(From::from)
     }
 
+    #[inline]
     fn write_bool(&mut self, b: bool) -> crate::Result<()> {
         if b {
             self.write_i8(1)
@@ -450,30 +503,37 @@ where
         }
     }
 
+    #[inline]
     fn write_i8(&mut self, i: i8) -> crate::Result<()> {
         self.transport.write_i8(i).map_err(From::from)
     }
 
+    #[inline]
     fn write_i16(&mut self, i: i16) -> crate::Result<()> {
         self.transport.write_i16::<BigEndian>(i).map_err(From::from)
     }
 
+    #[inline]
     fn write_i32(&mut self, i: i32) -> crate::Result<()> {
         self.transport.write_i32::<BigEndian>(i).map_err(From::from)
     }
 
+    #[inline]
     fn write_i64(&mut self, i: i64) -> crate::Result<()> {
         self.transport.write_i64::<BigEndian>(i).map_err(From::from)
     }
 
+    #[inline]
     fn write_double(&mut self, d: f64) -> crate::Result<()> {
         self.transport.write_f64::<BigEndian>(d).map_err(From::from)
     }
 
+    #[inline]
     fn write_string(&mut self, s: &str) -> crate::Result<()> {
         self.write_bytes(s.as_bytes())
     }
 
+    #[inline]
     fn write_uuid(&mut self, uuid: &uuid::Uuid) -> crate::Result<()> {
         self.transport
             .write_all(uuid.as_bytes())
@@ -521,6 +581,7 @@ where
     // utility
     //
 
+    #[inline]
     fn write_byte(&mut self, b: u8) -> crate::Result<()> {
         self.transport.write_u8(b).map_err(From::from)
     }
@@ -760,9 +821,11 @@ mod tests {
     fn must_write_field_begin() {
         let (_, mut o_prot) = test_objects(true);
 
-        assert!(o_prot
-            .write_field_begin(&TFieldIdentifier::new("some_field", TType::String, 22))
-            .is_ok());
+        assert!(
+            o_prot
+                .write_field_begin(&TFieldIdentifier::new("some_field", TType::String, 22))
+                .is_ok()
+        );
 
         let expected: [u8; 3] = [0x0B, 0x00, 0x16];
         assert_eq_written_bytes!(o_prot, expected);
@@ -823,9 +886,11 @@ mod tests {
     fn must_write_list_begin() {
         let (_, mut o_prot) = test_objects(true);
 
-        assert!(o_prot
-            .write_list_begin(&TListIdentifier::new(TType::Bool, 5))
-            .is_ok());
+        assert!(
+            o_prot
+                .write_list_begin(&TListIdentifier::new(TType::Bool, 5))
+                .is_ok()
+        );
 
         let expected: [u8; 5] = [0x02, 0x00, 0x00, 0x00, 0x05];
         assert_eq_written_bytes!(o_prot, expected);
@@ -866,9 +931,11 @@ mod tests {
     fn must_write_set_begin() {
         let (_, mut o_prot) = test_objects(true);
 
-        assert!(o_prot
-            .write_set_begin(&TSetIdentifier::new(TType::I16, 7))
-            .is_ok());
+        assert!(
+            o_prot
+                .write_set_begin(&TSetIdentifier::new(TType::I16, 7))
+                .is_ok()
+        );
 
         let expected: [u8; 5] = [0x06, 0x00, 0x00, 0x00, 0x07];
         assert_eq_written_bytes!(o_prot, expected);
@@ -908,9 +975,11 @@ mod tests {
     fn must_write_map_begin() {
         let (_, mut o_prot) = test_objects(true);
 
-        assert!(o_prot
-            .write_map_begin(&TMapIdentifier::new(TType::I64, TType::Struct, 32))
-            .is_ok());
+        assert!(
+            o_prot
+                .write_map_begin(&TMapIdentifier::new(TType::I64, TType::Struct, 32))
+                .is_ok()
+        );
 
         let expected: [u8; 6] = [0x0A, 0x0C, 0x00, 0x00, 0x00, 0x20];
         assert_eq_written_bytes!(o_prot, expected);
