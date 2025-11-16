@@ -47,7 +47,7 @@ jobs:
       fail-fast: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -86,7 +86,7 @@ jobs:
         php-version: [7.1, 7.2, 7.3, 7.4, 8.0, 8.1, 8.2, 8.3]
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
@@ -141,7 +141,7 @@ jobs:
           - '1.24'
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-go@v5
         with:
@@ -197,7 +197,7 @@ jobs:
     env:
       GRADLE_VERSION: "8.4"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-java@v4
         with:
@@ -305,7 +305,7 @@ jobs:
     strategy:
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -367,7 +367,7 @@ jobs:
     needs: compiler
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Run bootstrap
         run: ./bootstrap.sh
@@ -405,7 +405,7 @@ jobs:
     env:
       TOOLCHAIN_VERSION: 1.83.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -473,7 +473,7 @@ jobs:
           - "3.x"
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -526,7 +526,7 @@ jobs:
     needs: compiler
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Run bootstrap
         run: ./bootstrap.sh
@@ -566,7 +566,7 @@ jobs:
         client_lang: ['java,kotlin', 'go,rs', 'swift']
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v5
         with:
