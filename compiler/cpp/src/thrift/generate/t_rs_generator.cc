@@ -551,7 +551,7 @@ void t_rs_generator::render_attributes_and_includes() {
 
   // code may not be used
   f_gen_ << "#![allow(dead_code)]" << '\n';
-  // code always includes BTreeMap/BTreeSet/OrderedFloat
+  // code always includes HashMap/BTreeSet/OrderedFloat
   f_gen_ << "#![allow(unused_imports)]" << '\n';
   // code might not include imports from crates
   f_gen_ << "#![allow(unused_extern_crates)]" << '\n';
@@ -575,7 +575,7 @@ void t_rs_generator::render_attributes_and_includes() {
 
   // add standard includes
   f_gen_ << "use std::cell::RefCell;" << '\n';
-  f_gen_ << "use std::collections::{BTreeMap, BTreeSet};" << '\n';
+  f_gen_ << "use std::collections::{BTreeSet, HashMap};" << '\n';
   f_gen_ << "use std::convert::{From, TryFrom};" << '\n';
   f_gen_ << "use std::default::Default;" << '\n';
   f_gen_ << "use std::error::Error;" << '\n';
@@ -845,7 +845,7 @@ void t_rs_generator::render_const_set(t_type* ttype, t_const_value* tvalue) {
 void t_rs_generator::render_const_map(t_type* ttype, t_const_value* tvalue) {
   t_type* key_type = ((t_map*)ttype)->get_key_type();
   t_type* val_type = ((t_map*)ttype)->get_val_type();
-  f_gen_ << "BTreeMap::from([" << '\n';
+  f_gen_ << "HashMap::from([" << '\n';
   indent_up();
   const map<t_const_value*, t_const_value*, t_const_value::value_compare>& elems
       = tvalue->get_map();
@@ -897,7 +897,7 @@ void t_rs_generator::generate_enum(t_enum* tenum) {
 
 void t_rs_generator::render_enum_definition(t_enum* tenum, const string& enum_name) {
   render_rustdoc((t_doc*)tenum);
-  f_gen_ << "#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]" << '\n';
+  f_gen_ << "#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]" << '\n';
   f_gen_ << "pub struct " << enum_name << "(pub i32);" << '\n';
   f_gen_ << '\n';
 }
@@ -1074,7 +1074,7 @@ void t_rs_generator::render_struct_definition(const string& struct_name,
     }
   }
   f_gen_ << "#[derive(Clone, Debug" << (need_default ? ", Default" : "")
-         << ", Eq, Hash, Ord, PartialEq, PartialOrd)]" << '\n';
+         << ", PartialEq, serde::Serialize, serde::Deserialize)]" << '\n';
   f_gen_ << visibility_qualifier(struct_type) << "struct " << struct_name << " {" << '\n';
 
   // render the members
@@ -1361,7 +1361,7 @@ void t_rs_generator::render_union_definition(const string& union_name, t_struct*
     throw "cannot generate rust enum with 0 members"; // may be valid thrift, but it's invalid rust
   }
 
-  f_gen_ << "#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]" << '\n';
+  f_gen_ << "#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]" << '\n';
   f_gen_ << "pub enum " << union_name << " {" << '\n';
   indent_up();
 
@@ -1404,9 +1404,9 @@ void t_rs_generator::render_struct_sync_write(t_struct* tstruct,
   indent_up();
 
   // write struct header to output protocol
-  // note: use the *original* struct name here
+  // Use empty string to avoid allocation (binary protocol doesn't use struct names)
   f_gen_ << indent()
-         << "let struct_ident = TStructIdentifier::new(\"" + tstruct->get_name() + "\");" << '\n';
+         << "let struct_ident = TStructIdentifier::new(\"\");" << '\n';
   f_gen_ << indent() << "o_prot.write_struct_begin(&struct_ident)?;" << '\n';
 
   // write struct members to output protocol
@@ -1437,9 +1437,9 @@ void t_rs_generator::render_union_sync_write(const string& union_name, t_struct*
   indent_up();
 
   // write struct header to output protocol
-  // note: use the *original* struct name here
+  // Use empty string to avoid allocation (binary protocol doesn't use struct names)
   f_gen_ << indent()
-         << "let struct_ident = TStructIdentifier::new(\"" + tstruct->get_name() + "\");" << '\n';
+         << "let struct_ident = TStructIdentifier::new(\"\");" << '\n';
   f_gen_ << indent() << "o_prot.write_struct_begin(&struct_ident)?;" << '\n';
 
   // write the enum field to the output protocol
@@ -1484,9 +1484,10 @@ void t_rs_generator::render_struct_field_sync_write(const string& field_var,
   t_type* actual_type = get_true_type(field_type);
 
   ostringstream field_stream;
-  field_stream << "TFieldIdentifier::new("
-               << "\"" << tfield->get_name() << "\""
-               << ", " // note: use *original* name
+  // Use None for name to avoid String allocation (binary protocol doesn't use it)
+  field_stream << "TFieldIdentifier::new::<Option<&str>, &str, i16>("
+               << "None"
+               << ", "
                << to_rust_field_type_enum(field_type) << ", " << tfield->get_key() << ")";
   string field_ident_string = field_stream.str();
 
@@ -1962,9 +1963,13 @@ void t_rs_generator::render_type_sync_read(const string& type_var, t_type* ttype
       throw "cannot read field of type TYPE_VOID from input protocol";
     case t_base_type::TYPE_STRING:
       if (tbase_type->is_binary()) {
-        f_gen_ << indent() << "let " << type_var << " = i_prot.read_bytes()?;" << '\n';
+        string read_call = "i_prot.read_bytes()?";
+        read_call = is_boxed ? "Box::new(" + read_call + ")" : read_call;
+        f_gen_ << indent() << "let " << type_var << " = " << read_call << ";" << '\n';
       } else {
-        f_gen_ << indent() << "let " << type_var << " = i_prot.read_string()?;" << '\n';
+        string read_call = "i_prot.read_string()?";
+        read_call = is_boxed ? "Box::new(" + read_call + ")" : read_call;
+        f_gen_ << indent() << "let " << type_var << " = " << read_call << ";" << '\n';
       }
       return;
     case t_base_type::TYPE_UUID:
@@ -2002,7 +2007,9 @@ void t_rs_generator::render_type_sync_read(const string& type_var, t_type* ttype
     // so I have to pass this parameter along. Going with this approach because it
     // seems like the lowest-cost option to easily support recursive types.
     t_typedef* ttypedef = (t_typedef*)ttype;
-    render_type_sync_read(type_var, ttypedef->get_type(), ttypedef->is_forward_typedef());
+    // Pass is_boxed=true if either the incoming is_boxed is true OR this typedef is forward
+    // This handles typedef chaining where a forward typedef wraps a non-forward typedef
+    render_type_sync_read(type_var, ttypedef->get_type(), is_boxed || ttypedef->is_forward_typedef());
     return;
   } else if (ttype->is_enum() || ttype->is_struct() || ttype->is_xception()) {
     string read_call(to_rust_type(ttype) + "::read_from_in_protocol(i_prot)?");
@@ -2040,9 +2047,11 @@ void t_rs_generator::render_list_sync_read(t_list* tlist, const string& list_var
   if (elem_is_union) {
     string resolved_type = to_rust_type(resolved_elem);
     string read_call(resolved_type + "::read_from_in_protocol(i_prot)");
+    string union_val_var = tmp("union_val_");
     f_gen_ << indent() << "match " << read_call << " {" << '\n';
     indent_up();
-    f_gen_ << indent() << "Ok(elem) => { " << list_var << ".push(Box::new(elem)); }," << '\n';
+    f_gen_ << indent() << "Ok(" << union_val_var << ") => { " << list_var << ".push(Box::new("
+           << union_val_var << ")); }," << '\n';
     f_gen_ << indent() << "Err(thrift::Error::Protocol(ref e)) if e.kind == ProtocolErrorKind::UnknownUnionVariant => { continue; }," << '\n';
     f_gen_ << indent() << "Err(e) => return Err(e)," << '\n';
     indent_down();
@@ -2075,9 +2084,11 @@ void t_rs_generator::render_set_sync_read(t_set* tset, const string& set_var) {
   if (elem_is_union) {
     string resolved_type = to_rust_type(resolved_elem);
     string read_call(resolved_type + "::read_from_in_protocol(i_prot)");
+    string union_val_var = tmp("union_val_");
     f_gen_ << indent() << "match " << read_call << " {" << '\n';
     indent_up();
-    f_gen_ << indent() << "Ok(elem) => { " << set_var << ".insert(Box::new(elem)); }," << '\n';
+    f_gen_ << indent() << "Ok(" << union_val_var << ") => { " << set_var << ".insert(Box::new("
+           << union_val_var << ")); }," << '\n';
     f_gen_ << indent() << "Err(thrift::Error::Protocol(ref e)) if e.kind == ProtocolErrorKind::UnknownUnionVariant => { continue; }," << '\n';
     f_gen_ << indent() << "Err(e) => return Err(e)," << '\n';
     indent_down();
@@ -2100,7 +2111,7 @@ void t_rs_generator::render_map_sync_read(t_map* tmap, const string& map_var) {
 
   f_gen_ << indent() << "let map_ident = i_prot.read_map_begin()?;" << '\n';
   f_gen_ << indent() << "let mut " << map_var << ": " << to_rust_type((t_type*)tmap)
-         << " = BTreeMap::new();" << '\n';
+         << " = HashMap::with_capacity(map_ident.size as usize);" << '\n';
   f_gen_ << indent() << "for _ in 0..map_ident.size {" << '\n';
 
   indent_up();
@@ -2114,9 +2125,10 @@ void t_rs_generator::render_map_sync_read(t_map* tmap, const string& map_var) {
     string key_elem_var = tmp("map_key_");
     if (key_is_union) {
       string key_read(to_rust_type(resolved_key) + "::read_from_in_protocol(i_prot)");
+      string union_key_var = tmp("union_key_");
       f_gen_ << indent() << "let " << key_elem_var << " = match " << key_read << " {" << '\n';
       indent_up();
-      f_gen_ << indent() << "Ok(val) => val," << '\n';
+      f_gen_ << indent() << "Ok(" << union_key_var << ") => " << union_key_var << "," << '\n';
       f_gen_ << indent() << "Err(thrift::Error::Protocol(ref e)) if e.kind == ProtocolErrorKind::UnknownUnionVariant => {" << '\n';
       indent_up();
       // Skip the value and continue to next entry
@@ -2134,9 +2146,11 @@ void t_rs_generator::render_map_sync_read(t_map* tmap, const string& map_var) {
     string val_elem_var = tmp("map_val_");
     if (val_is_union) {
       string val_read(to_rust_type(resolved_val) + "::read_from_in_protocol(i_prot)");
+      string union_val_var = tmp("union_val_");
       f_gen_ << indent() << "match " << val_read << " {" << '\n';
       indent_up();
-      f_gen_ << indent() << "Ok(val) => { " << map_var << ".insert(" << key_elem_var << ", val); }," << '\n';
+      f_gen_ << indent() << "Ok(" << union_val_var << ") => { " << map_var << ".insert("
+             << key_elem_var << ", " << union_val_var << "); }," << '\n';
       f_gen_ << indent() << "Err(thrift::Error::Protocol(ref e)) if e.kind == ProtocolErrorKind::UnknownUnionVariant => { continue; }," << '\n';
       f_gen_ << indent() << "Err(e) => return Err(e)," << '\n';
       indent_down();
@@ -3078,7 +3092,7 @@ string t_rs_generator::to_rust_type(t_type* ttype) {
     return rust_namespace(ttype) + rust_camel_case(ttype->get_name());
   } else if (ttype->is_map()) {
     t_map* tmap = (t_map*)ttype;
-    return "BTreeMap<" + to_rust_type(tmap->get_key_type()) + ", "
+    return "HashMap<" + to_rust_type(tmap->get_key_type()) + ", "
            + to_rust_type(tmap->get_val_type()) + ">";
   } else if (ttype->is_set()) {
     t_set* tset = (t_set*)ttype;
@@ -3182,7 +3196,7 @@ string t_rs_generator::opt_in_req_out_value(t_type* ttype) {
   } else if (ttype->is_set()) {
     return "Some(BTreeSet::new())";
   } else if (ttype->is_map()) {
-    return "Some(BTreeMap::new())";
+    return "None";  // Lazy initialization - avoids allocating empty HashMap
   }
 
   throw "cannot generate opt-in-req-out value for type " + ttype->get_name();

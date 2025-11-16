@@ -16,7 +16,7 @@ keywords = ["thrift"]
 byteorder = "1.5"
 uuid = "1"
 log = { version = "0.4", optional = true }
-ordered-float = "5"
+ordered-float = { version = "5", features = ["serde"] }
 threadpool = { version = "1.7", optional = true }
 rustls = { version = "0.23.42", default-features = false, features = ["std", "tls12"], optional = true }
 varint-rs = "2.2.1"
