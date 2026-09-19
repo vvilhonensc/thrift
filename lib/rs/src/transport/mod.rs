@@ -64,7 +64,52 @@ pub use self::socket::TTcpChannel;
 pub use self::tls::{TTlsClientChannel, TTlsServerChannel};
 
 /// Identifies a transport used by a `TInputProtocol` to receive bytes.
-pub trait TReadTransport: Read {}
+///
+/// Custom readers can implement this trait with the default methods, or be
+/// wrapped in a [`TBufferedReadTransport`] to enable borrowed reads.
+pub trait TReadTransport: Read {
+    /// Call `f` exactly once with the next `n` bytes, then consume them.
+    /// The slice is valid only during the callback. On an I/O error the
+    /// callback is not called, but some input may already have been consumed.
+    ///
+    /// The default copies into a stack buffer for up to 16 bytes, and into a
+    /// temporary allocation for larger requests. Buffered implementations can
+    /// lend their storage instead. Framed transports reject requests spanning
+    /// frames with `UnexpectedEof`.
+    fn with_bytes(&mut self, n: usize, f: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+        with_bytes_fallback(self, n, f)
+    }
+
+    /// Discard exactly `n` bytes, returning `UnexpectedEof` if input runs out.
+    /// On error some input may already have been consumed.
+    fn skip_bytes(&mut self, n: usize) -> io::Result<()> {
+        let mut limited = self.take(n as u64);
+        if io::copy(&mut limited, &mut io::sink())? != n as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "failed to skip bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn with_bytes_fallback<T: Read + ?Sized>(
+    transport: &mut T,
+    n: usize,
+    f: &mut dyn FnMut(&[u8]),
+) -> io::Result<()> {
+    if n <= 16 {
+        let mut buf = [0; 16];
+        transport.read_exact(&mut buf[..n])?;
+        f(&buf[..n]);
+    } else {
+        let mut buf = vec![0; n];
+        transport.read_exact(&mut buf)?;
+        f(&buf);
+    }
+    Ok(())
+}
 
 /// Helper type used by a server to create `TReadTransport` instances for
 /// accepted client connections.
@@ -83,7 +128,49 @@ pub trait TWriteTransportFactory {
     fn create(&self, channel: Box<dyn Write + Send>) -> Box<dyn TWriteTransport + Send>;
 }
 
-impl<T> TReadTransport for T where T: Read {}
+impl<T: TReadTransport + ?Sized> TReadTransport for Box<T> {
+    #[inline]
+    fn with_bytes(&mut self, n: usize, f: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+        (**self).with_bytes(n, f)
+    }
+    #[inline]
+    fn skip_bytes(&mut self, n: usize) -> io::Result<()> {
+        (**self).skip_bytes(n)
+    }
+}
+
+impl<T: TReadTransport + ?Sized> TReadTransport for &mut T {
+    #[inline]
+    fn with_bytes(&mut self, n: usize, f: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+        (**self).with_bytes(n, f)
+    }
+    #[inline]
+    fn skip_bytes(&mut self, n: usize) -> io::Result<()> {
+        (**self).skip_bytes(n)
+    }
+}
+
+impl TReadTransport for dyn Read + '_ {}
+impl TReadTransport for dyn Read + Send + '_ {}
+impl TReadTransport for dyn Read + Sync + '_ {}
+impl TReadTransport for dyn Read + Send + Sync + '_ {}
+impl<T: AsRef<[u8]>> TReadTransport for io::Cursor<T> {}
+impl TReadTransport for &[u8] {}
+impl<T: Read> TReadTransport for io::BufReader<T> {}
+impl<T: Read> TReadTransport for io::Take<T> {}
+impl<T: Read, U: Read> TReadTransport for io::Chain<T, U> {}
+impl TReadTransport for io::Empty {}
+impl TReadTransport for io::Repeat {}
+impl TReadTransport for std::fs::File {}
+impl TReadTransport for std::net::TcpStream {}
+impl TReadTransport for TBufferChannel {}
+impl TReadTransport for TTcpChannel {}
+impl<C: Read> TReadTransport for TSharedChannel<C> {}
+impl<C: Read> TReadTransport for ReadHalf<C> {}
+#[cfg(feature = "rustls")]
+impl TReadTransport for TTlsClientChannel {}
+#[cfg(feature = "rustls")]
+impl TReadTransport for TTlsServerChannel {}
 
 impl<T> TWriteTransport for T where T: Write {}
 

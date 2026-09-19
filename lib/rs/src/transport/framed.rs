@@ -88,6 +88,45 @@ where
     }
 }
 
+impl<C: Read> TFramedReadTransport<C> {
+    #[cold]
+    #[inline(never)]
+    fn fill_at_least(&mut self, n: usize) -> io::Result<()> {
+        if self.pos == self.cap {
+            // An empty read loads the next frame without consuming its payload.
+            self.read(&mut [])?;
+        }
+        if n > self.cap - self.pos {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "request exceeds remaining frame bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<C: Read> TReadTransport for TFramedReadTransport<C> {
+    #[inline(always)]
+    fn with_bytes(&mut self, n: usize, f: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+        if n > self.cap - self.pos {
+            self.fill_at_least(n)?;
+        }
+        f(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn skip_bytes(&mut self, n: usize) -> io::Result<()> {
+        if n > self.cap - self.pos {
+            self.fill_at_least(n)?;
+        }
+        self.pos += n;
+        Ok(())
+    }
+}
+
 impl<C> Read for TFramedReadTransport<C>
 where
     C: Read,

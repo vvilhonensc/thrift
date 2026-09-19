@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use byteorder::{BigEndian, ByteOrder, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
+use smallvec::SmallVec;
 use std::convert::{From, TryFrom};
-use std::mem::MaybeUninit;
 
 use super::{
     TFieldIdentifier, TInputProtocol, TInputProtocolFactory, TListIdentifier, TMapIdentifier,
@@ -28,6 +28,22 @@ use crate::transport::{TReadTransport, TWriteTransport};
 use crate::{ProtocolError, ProtocolErrorKind, TConfiguration};
 
 const BINARY_PROTOCOL_VERSION_1: u32 = 0x8001_0000;
+
+#[derive(Clone, Copy)]
+enum SkipFrame {
+    Values(TType),
+    Struct,
+    Map(TType, TType),
+}
+
+#[cold]
+#[inline(never)]
+fn skip_depth_error(field_type: TType) -> crate::Error {
+    crate::Error::Protocol(ProtocolError::new(
+        ProtocolErrorKind::DepthLimit,
+        format!("cannot parse past {:?}", field_type),
+    ))
+}
 
 /// Read messages encoded in the Thrift simple binary encoding.
 ///
@@ -83,6 +99,7 @@ where
         }
     }
 
+    #[inline]
     fn check_recursion_depth(&self) -> crate::Result<()> {
         if let Some(limit) = self.config.max_recursion_depth() {
             if self.recursion_depth >= limit {
@@ -94,6 +111,50 @@ where
         }
         Ok(())
     }
+
+    #[inline(always)]
+    fn with_bytes<R>(&mut self, n: usize, f: impl FnOnce(&[u8]) -> R) -> crate::Result<R> {
+        let mut f = Some(f);
+        let mut result = None;
+        self.transport.with_bytes(n, &mut |bytes| {
+            result = Some(f.take().expect("transport called callback twice")(bytes));
+        })?;
+        Ok(result.expect("transport did not call callback"))
+    }
+
+    #[inline]
+    fn read_bytes_len(&mut self) -> crate::Result<usize> {
+        let num_bytes = self.read_i32()?;
+        if num_bytes < 0 {
+            return Err(crate::Error::Protocol(ProtocolError::new(
+                ProtocolErrorKind::NegativeSize,
+                format!("Negative byte array size: {}", num_bytes),
+            )));
+        }
+        if let Some(max_size) = self.config.max_string_size() {
+            if num_bytes as usize > max_size {
+                return Err(crate::Error::Protocol(ProtocolError::new(
+                    ProtocolErrorKind::SizeLimit,
+                    format!(
+                        "Byte array size {} exceeds maximum allowed size of {}",
+                        num_bytes, max_size
+                    ),
+                )));
+            }
+        }
+        Ok(num_bytes as usize)
+    }
+
+    #[inline]
+    fn read_string_body(&mut self, len: usize) -> crate::Result<String> {
+        self.with_bytes(len, |bytes| std::str::from_utf8(bytes).map(str::to_owned))?
+            .map_err(|e| {
+                crate::Error::Protocol(ProtocolError::new(
+                    ProtocolErrorKind::InvalidData,
+                    e.to_string(),
+                ))
+            })
+    }
 }
 
 impl<T> TInputProtocol for TBinaryInputProtocol<T>
@@ -104,8 +165,7 @@ where
     fn read_message_begin(&mut self) -> crate::Result<TMessageIdentifier> {
         // TODO: start the per-message byte count here once a transport can keep
         // one; see check_container_size in protocol/mod.rs.
-        let mut first_bytes = [0u8; 4];
-        self.transport.read_exact(&mut first_bytes)?;
+        let first_bytes: [u8; 4] = self.with_bytes(4, |b| b.try_into().unwrap())?;
 
         // the thrift version header is intentionally negative
         // so the first check we'll do is see if the sign bit is set
@@ -150,9 +210,7 @@ where
                         )));
                     }
                 }
-                let mut name_buf: Vec<u8> = vec![0; name_size];
-                self.transport.read_exact(&mut name_buf)?;
-                let name = String::from_utf8(name_buf)?;
+                let name = self.read_string_body(name_size)?;
 
                 // read the rest of the fields
                 let message_type: TMessageType = self.read_byte().and_then(TryFrom::try_from)?;
@@ -166,17 +224,20 @@ where
         Ok(())
     }
 
+    #[inline]
     fn read_struct_begin(&mut self) -> crate::Result<Option<TStructIdentifier>> {
         self.check_recursion_depth()?;
         self.recursion_depth += 1;
         Ok(None)
     }
 
+    #[inline]
     fn read_struct_end(&mut self) -> crate::Result<()> {
         self.recursion_depth -= 1;
         Ok(())
     }
 
+    #[inline]
     fn read_field_begin(&mut self) -> crate::Result<TFieldIdentifier> {
         let field_type_byte = self.read_byte()?;
         let field_type = field_type_from_u8(field_type_byte)?;
@@ -195,47 +256,8 @@ where
 
     #[inline(always)]
     fn read_bytes(&mut self) -> crate::Result<Vec<u8>> {
-        let num_bytes = self.transport.read_i32::<BigEndian>()?;
-
-        if num_bytes < 0 {
-            return Err(crate::Error::Protocol(ProtocolError::new(
-                ProtocolErrorKind::NegativeSize,
-                format!("Negative byte array size: {}", num_bytes),
-            )));
-        }
-
-        if let Some(max_size) = self.config.max_string_size() {
-            if num_bytes as usize > max_size {
-                return Err(crate::Error::Protocol(ProtocolError::new(
-                    ProtocolErrorKind::SizeLimit,
-                    format!(
-                        "Byte array size {} exceeds maximum allowed size of {}",
-                        num_bytes, max_size
-                    ),
-                )));
-            }
-        }
-
-        let num_bytes = num_bytes as usize;
-        if num_bytes == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut buf: Vec<MaybeUninit<u8>> = Vec::with_capacity(num_bytes);
-        // SAFETY: read_exact below either fully initializes the buffer or returns
-        // Err, in which case buf is dropped without being observed.
-        unsafe {
-            buf.set_len(num_bytes);
-        }
-
-        let buf_slice =
-            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, num_bytes) };
-
-        self.transport.read_exact(buf_slice)?;
-
-        let buf = unsafe { std::mem::transmute::<Vec<MaybeUninit<u8>>, Vec<u8>>(buf) };
-
-        Ok(buf)
+        let num_bytes = self.read_bytes_len()?;
+        self.with_bytes(num_bytes, <[u8]>::to_vec)
     }
 
     #[inline]
@@ -249,44 +271,41 @@ where
 
     #[inline]
     fn read_i8(&mut self) -> crate::Result<i8> {
-        self.transport.read_i8().map_err(From::from)
+        self.with_bytes(1, |b| b[0] as i8)
     }
 
     #[inline]
     fn read_i16(&mut self) -> crate::Result<i16> {
-        self.transport.read_i16::<BigEndian>().map_err(From::from)
+        self.with_bytes(2, |b| i16::from_be_bytes(b.try_into().unwrap()))
     }
 
     #[inline]
     fn read_i32(&mut self) -> crate::Result<i32> {
-        self.transport.read_i32::<BigEndian>().map_err(From::from)
+        self.with_bytes(4, |b| i32::from_be_bytes(b.try_into().unwrap()))
     }
 
     #[inline]
     fn read_i64(&mut self) -> crate::Result<i64> {
-        self.transport.read_i64::<BigEndian>().map_err(From::from)
+        self.with_bytes(8, |b| i64::from_be_bytes(b.try_into().unwrap()))
     }
 
     #[inline]
     fn read_double(&mut self) -> crate::Result<f64> {
-        self.transport.read_f64::<BigEndian>().map_err(From::from)
+        self.with_bytes(8, |b| f64::from_be_bytes(b.try_into().unwrap()))
     }
 
     #[inline]
     fn read_uuid(&mut self) -> crate::Result<uuid::Uuid> {
-        let mut buf = [0u8; 16];
-        self.transport
-            .read_exact(&mut buf)
-            .map(|_| uuid::Uuid::from_bytes(buf))
-            .map_err(From::from)
+        self.with_bytes(16, |b| uuid::Uuid::from_bytes(b.try_into().unwrap()))
     }
 
     #[inline(always)]
     fn read_string(&mut self) -> crate::Result<String> {
-        let bytes = self.read_bytes()?;
-        String::from_utf8(bytes).map_err(From::from)
+        let len = self.read_bytes_len()?;
+        self.read_string_body(len)
     }
 
+    #[inline]
     fn read_list_begin(&mut self) -> crate::Result<TListIdentifier> {
         let element_type: TType = self.read_byte().and_then(field_type_from_u8)?;
         let size = self.read_i32()?;
@@ -299,6 +318,7 @@ where
         Ok(())
     }
 
+    #[inline]
     fn read_set_begin(&mut self) -> crate::Result<TSetIdentifier> {
         let element_type: TType = self.read_byte().and_then(field_type_from_u8)?;
         let size = self.read_i32()?;
@@ -311,6 +331,7 @@ where
         Ok(())
     }
 
+    #[inline]
     fn read_map_begin(&mut self) -> crate::Result<TMapIdentifier> {
         let key_type: TType = self.read_byte().and_then(field_type_from_u8)?;
         let value_type: TType = self.read_byte().and_then(field_type_from_u8)?;
@@ -328,14 +349,118 @@ where
         Ok(())
     }
 
+    fn skip_till_depth(&mut self, field_type: TType, depth: i8) -> crate::Result<()> {
+        if depth <= 0 {
+            return Err(skip_depth_error(field_type));
+        }
+        if let Some(width) = fixed_width(field_type) {
+            return self.transport.skip_bytes(width).map_err(From::from);
+        }
+        // The root frame accounts for the value being skipped. Each open
+        // container adds exactly one frame, including maps with alternating
+        // key/value types, so stack length is the current skip depth.
+        let mut stack: SmallVec<[(SkipFrame, usize); 16]> = SmallVec::new();
+        stack.push((SkipFrame::Values(field_type), 1));
+        while let Some((frame, remaining)) = stack.last_mut() {
+            let ty = match *frame {
+                SkipFrame::Struct => {
+                    let ty = field_type_from_u8(self.read_byte()?)?;
+                    if ty == TType::Stop {
+                        self.read_struct_end()?;
+                        stack.pop();
+                        continue;
+                    }
+                    self.transport.skip_bytes(2)?;
+                    ty
+                }
+                SkipFrame::Values(ty) => {
+                    if *remaining == 0 {
+                        stack.pop();
+                        continue;
+                    }
+                    *remaining -= 1;
+                    ty
+                }
+                SkipFrame::Map(key, value) => {
+                    if *remaining == 0 {
+                        stack.pop();
+                        continue;
+                    }
+                    let ty = if *remaining % 2 == 0 { key } else { value };
+                    *remaining -= 1;
+                    ty
+                }
+            };
+            if stack.len() > depth as usize {
+                return Err(skip_depth_error(ty));
+            }
+            if let Some(width) = fixed_width(ty) {
+                self.transport.skip_bytes(width)?;
+                continue;
+            }
+            match ty {
+                TType::String => {
+                    let len = self.read_bytes_len()?;
+                    self.transport.skip_bytes(len)?;
+                }
+                TType::Struct => {
+                    self.read_struct_begin()?;
+                    stack.push((SkipFrame::Struct, 0));
+                }
+                TType::List | TType::Set => {
+                    // Binary list and set headers have the same representation and checks.
+                    let list = self.read_list_begin()?;
+                    if list.size > 0 {
+                        if let Some(width) = fixed_width(list.element_type) {
+                            // Bulk skips still account for the element's depth.
+                            if stack.len() >= depth as usize {
+                                return Err(skip_depth_error(list.element_type));
+                            }
+                            let len = (list.size as usize).checked_mul(width).ok_or_else(|| {
+                                crate::Error::Protocol(ProtocolError::new(
+                                    ProtocolErrorKind::SizeLimit,
+                                    "container byte size overflow",
+                                ))
+                            })?;
+                            self.transport.skip_bytes(len)?;
+                        } else {
+                            stack.push((SkipFrame::Values(list.element_type), list.size as usize));
+                        }
+                    }
+                }
+                TType::Map => {
+                    let map = self.read_map_begin()?;
+                    if map.size > 0 {
+                        stack.push((
+                            SkipFrame::Map(
+                                map.key_type.expect("non-empty map key type"),
+                                map.value_type.expect("non-empty map value type"),
+                            ),
+                            // Twice a nonnegative i32 fits in usize on supported targets.
+                            map.size as usize * 2,
+                        ));
+                    }
+                }
+                ty => {
+                    return Err(crate::Error::Protocol(ProtocolError::new(
+                        ProtocolErrorKind::Unknown,
+                        format!("cannot skip field type {:?}", ty),
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     // utility
     //
 
     #[inline]
     fn read_byte(&mut self) -> crate::Result<u8> {
-        self.transport.read_u8().map_err(From::from)
+        self.with_bytes(1, |b| b[0])
     }
 
+    #[inline]
     fn min_serialized_size(&self, field_type: TType) -> usize {
         match field_type {
             TType::Stop => 1,   // 1 byte minimum
@@ -354,6 +479,18 @@ where
             TType::Uuid => 16,  // 16 bytes
             TType::Utf7 => 1,   // 1 byte
         }
+    }
+}
+
+#[inline]
+fn fixed_width(field_type: TType) -> Option<usize> {
+    match field_type {
+        TType::Bool | TType::I08 => Some(1),
+        TType::I16 => Some(2),
+        TType::I32 => Some(4),
+        TType::I64 | TType::Double => Some(8),
+        TType::Uuid => Some(16),
+        _ => None,
     }
 }
 
@@ -643,6 +780,7 @@ fn field_type_to_u8(field_type: TType) -> u8 {
     }
 }
 
+#[inline]
 fn field_type_from_u8(b: u8) -> crate::Result<TType> {
     match b {
         0x00 => Ok(TType::Stop),
@@ -1259,9 +1397,10 @@ mod tests {
         match result {
             Err(crate::Error::Protocol(e)) => {
                 assert_eq!(e.kind, ProtocolErrorKind::SizeLimit);
-                assert!(e
-                    .message
-                    .contains("Container size 200 exceeds maximum allowed size of 100"));
+                assert!(
+                    e.message
+                        .contains("Container size 200 exceeds maximum allowed size of 100")
+                );
             }
             _ => panic!("Expected protocol error with SizeLimit"),
         }
@@ -1313,9 +1452,10 @@ mod tests {
         match result {
             Err(crate::Error::Protocol(e)) => {
                 assert_eq!(e.kind, ProtocolErrorKind::SizeLimit);
-                assert!(e
-                    .message
-                    .contains("Byte array size 2000 exceeds maximum allowed size of 1000"));
+                assert!(
+                    e.message
+                        .contains("Byte array size 2000 exceeds maximum allowed size of 1000")
+                );
             }
             _ => panic!("Expected protocol error with SizeLimit"),
         }
@@ -1340,9 +1480,10 @@ mod tests {
         match result {
             Err(crate::Error::Protocol(e)) => {
                 assert_eq!(e.kind, ProtocolErrorKind::SizeLimit);
-                assert!(e
-                    .message
-                    .contains("Message name size 2000 exceeds maximum allowed size of 1000"));
+                assert!(
+                    e.message
+                        .contains("Message name size 2000 exceeds maximum allowed size of 1000")
+                );
             }
             _ => panic!("Expected protocol error with SizeLimit"),
         }

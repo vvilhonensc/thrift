@@ -960,6 +960,7 @@ pub fn prealloc_size(size: i32) -> usize {
 /// - Container size doesn't exceed configured maximum
 /// - Container size * element size doesn't overflow
 /// - Container memory requirements don't exceed message size limit
+#[inline]
 pub(crate) fn check_container_size(
     config: &TConfiguration,
     container_size: i32,
@@ -992,9 +993,7 @@ pub(crate) fn check_container_size(
     if let Some(min_bytes_needed) = size_as_usize.checked_mul(element_size) {
         // TODO: hold min_bytes_needed to what is left of the current message
         // rather than to the whole max_message_size. The other bindings keep
-        // that count in their transports, but every io::Read is a
-        // TReadTransport through one blanket impl, so a Rust transport cannot
-        // supply its own count until trait specialization is stable.
+        // that count in their transports; Rust transports do not yet expose it.
         // Up-front allocation does not depend on this check: generated code
         // reserves list capacity through prealloc_size, which caps it.
         if let Some(max_message_size) = config.max_message_size() {

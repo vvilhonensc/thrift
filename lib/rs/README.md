@@ -63,6 +63,19 @@ Rust 1.71+.
 
 ### Breaking Changes
 
+`TReadTransport` now provides object-safe `with_bytes` and `skip_bytes` methods.
+Buffered and framed transports use their internal storage for borrowed reads;
+binary input protocols use these methods automatically, including when reading
+generated structs. Framed borrowed reads and skips must fit within one frame.
+
+The blanket implementation for all `std::io::Read` types has been replaced by
+explicit implementations for built-in transports and common standard readers.
+Custom readers passed directly to a protocol need an implementation such as
+`impl thrift::transport::TReadTransport for MyReader {}`. The default methods
+use copying reads. Alternatively, wrap a reader in `TBufferedReadTransport` to
+use buffered borrowed reads. Requests larger than its buffer use a temporary
+allocation; skipped bytes do not require that allocation.
+
 Breaking changes are minimized. When they are made they will be outlined below with transition guidelines.
 
 ##### Thrift 0.15.0

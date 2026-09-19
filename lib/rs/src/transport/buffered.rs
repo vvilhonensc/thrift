@@ -200,6 +200,87 @@ where
     }
 }
 
+impl<C: Read> TBufferedReadTransport<C> {
+    // Oversized requests use temporary storage so the read buffer stays fixed-size.
+    // Return it to the caller to keep the callback out of this out-of-line path.
+    #[cold]
+    #[inline(never)]
+    fn fill_at_least(&mut self, n: usize) -> io::Result<Option<Vec<u8>>> {
+        if n > self.buf.len() {
+            let mut bytes = vec![0; n];
+            Read::read_exact(self, &mut bytes)?;
+            return Ok(Some(bytes));
+        }
+        self.buf.copy_within(self.pos..self.cap, 0);
+        self.cap -= self.pos;
+        self.pos = 0;
+        while self.cap < n {
+            match self.chan.read(&mut self.buf[self.cap..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to fill buffer",
+                    ));
+                }
+                Ok(read) => self.cap += read,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn skip_bytes_slow(&mut self, mut n: usize) -> io::Result<()> {
+        loop {
+            let consumed = n.min(self.cap - self.pos);
+            self.pos += consumed;
+            n -= consumed;
+            if n == 0 {
+                return Ok(());
+            }
+            self.pos = 0;
+            self.cap = 0;
+            match self.chan.read(&mut self.buf) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "failed to skip bytes",
+                    ));
+                }
+                Ok(read) => self.cap = read,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl<C: Read> TReadTransport for TBufferedReadTransport<C> {
+    #[inline(always)]
+    fn with_bytes(&mut self, n: usize, f: &mut dyn FnMut(&[u8])) -> io::Result<()> {
+        if n > self.cap - self.pos {
+            if let Some(bytes) = self.fill_at_least(n)? {
+                f(&bytes);
+                return Ok(());
+            }
+        }
+        f(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn skip_bytes(&mut self, n: usize) -> io::Result<()> {
+        if n > self.cap - self.pos {
+            return self.skip_bytes_slow(n);
+        }
+        self.pos += n;
+        Ok(())
+    }
+}
+
 impl<C> Read for TBufferedReadTransport<C>
 where
     C: Read,
